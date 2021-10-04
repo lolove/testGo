@@ -43,9 +43,7 @@ func main() {
 	}
 
   kafkaConn,err := initKafka() 
-
-  
-
+	// 123
 	db, err := initDB()
 	if err != nil {
 		log.Print(err)
