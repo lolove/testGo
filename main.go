@@ -44,6 +44,8 @@ func main() {
 
   kafkaConn,err := initKafka() 
 
+  
+
 	db, err := initDB()
 	if err != nil {
 		log.Print(err)
@@ -196,4 +198,41 @@ func initKafka() (*kafka.Conn ,error){
 
 	conn, err := kafka.DialLeader(context.Background(), "tcp", "dory-01.srvs.cloudkafka.com:9094,dory-02.srvs.cloudkafka.com:9094,dory-03.srvs.cloudkafka.com:9094", topic, partition)
 	return conn, err
+}
+
+func consumerCashTopic(conn *kafka.Conn,db *gorm.DB){
+  batch := conn.ReadBatch(10e3, 1e6)
+  b:= make([]byte,10e3)
+  for{
+    _,err := batch.Read(b)
+    if err != nil{
+      break
+    }
+
+    fmt.Println(string((b)))
+    var user  = &Users{}
+    err = json.Unmarshal(b, user)
+    if err != nil{
+      fmt.Printf("consumerCashTopic get err : %v",err)
+      continue
+    }
+
+    if user.Name == ""{
+      continue
+    }
+
+    user.ID = 0
+
+    var myUser = &Users{
+      Name:user.Name,
+      WalletAmount:user.WalletAmount,
+    }
+
+    err = db.Where("name = ?", user.Name).FirstOrCreate(myUser).Error
+
+    if myUser.WalletAmount != user.WalletAmount {
+      err = db.Model(&Users{}).Update("wallet_amount", user.WalletAmount).Where("name = ?", user.Name).Error
+    }
+    
+  }
 }
