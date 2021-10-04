@@ -1,72 +1,72 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-  kafka "github.com/segmentio/kafka-go"
-	"github.com/go-redis/redis"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
-  "encoding/json"
-  "context"
+
+	"github.com/go-redis/redis"
+	kafka "github.com/segmentio/kafka-go"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 )
 
-const (
-	UserName     string = "vsgzsg4ieoutdysr"
-	Password     string = "zxh5755xi5804kfr"
-	Addr         string = "nnsgluut5mye50or.cbetxkdyhwsb.us-east-1.rds.amazonaws.com"
-	Port         int    = 3306
-	Database     string = "rz4cip81n7mk2fdk"
-	MaxLifetime  int    = 10
-	MaxOpenConns int    = 10
-	MaxIdleConns int    = 10
-)
-
-type Users struct {
+type User struct {
 	ID           int64
 	Name         string
 	WalletAmount int64
 }
 
-func main() {
-	// cnt := 3
-	// Heroku 的 PORT 是放在「環境變數」中，所以用 os.Gatenv("PORT") 載入
+/*
+{
+	"id": 1,
+	"name": jase,
+	"walletAmount": 100
+}
+*/
 
+func (User) TableName() string {
+	return "users_jase"
+}
+
+func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		// log.Fatal("$PORT must be set")
 		port = "8080"
 	}
 
-  kafkaConn,err := initKafka() 
-	// 123
 	db, err := initDB()
 	if err != nil {
-		log.Print(err)
+		log.Printf("initDB get error: %v\n", err)
 		return
 	}
+
 	redisClient, err := initRedis()
 	if err != nil {
-		log.Print(err)
+		log.Printf("initRedis get error: %v\n", err)
 		return
 	}
+
+	kafkaWriter := initKafka()
+
+	go consumerCashTopic(db)
 
 	http.HandleFunc("/cash", func(w http.ResponseWriter, r *http.Request) {
 		m := r.URL.Query()
 		names := m["name"]
-		amountSlice := m["amount"]
-
 		if len(names) != 1 {
 			fmt.Fprintln(w, "name 輸入不合法")
 			return
 		}
+		name := names[0]
 
-		name :=names[0]
-
+		amountSlice := m["amount"]
 		if len(amountSlice) != 1 {
 			fmt.Fprintln(w, "找不到 amount key")
 			return
@@ -78,159 +78,178 @@ func main() {
 			return
 		}
 
-		lockSuccess:=redisClient.SetNX(name,"lock"+"mingyu",10+time.Second).Val()
-		if lockSuccess{
-			user := &Users{}
+		// 搶 Redis 鎖
+		lockSuccess := redisClient.SetNX(name, "lock"+"jase", 10*time.Second).Val()
+		if lockSuccess { // 如果有搶到鎖
+			defer func() {
+				// 釋放鎖(先確認鎖還是不是自己的)
+				lockVal := redisClient.Get(name).String()
+				if lockVal == "lock"+"jase" {
+					redisClient.Del(name)
+				}
+			}()
+			// 取得資料庫的用戶錢包
+			var user = &User{}
 			err := db.Where("name = ?", name).First(&user).Error
-
-			if err !=nil{
-				fmt.Fprintln(w, "user is not exixt")
+			if err != nil {
+				fmt.Fprintln(w, "db.Where get error: "+err.Error()+", name = "+name)
 				return
 			}
-			user.WalletAmount+=int64(amount)
-			if user.WalletAmount<0{
-				fmt.Fprintln(w, name+"是窮鬼，他的wallet沒錢了，所以交易失敗!!")
+			// 增減用戶錢包
+			user.WalletAmount += int64(amount)
+
+			// 更新用戶錢包金額
+			err = db.Model(user).Update("wallet_amount", user.WalletAmount).Error
+			if err != nil {
+				fmt.Fprintln(w, "db.Model(user).Update get error: "+err.Error()+", user: "+fmt.Sprintf("%+v", user))
 				return
 			}
+			needRollback := false
+			defer func() {
+				if needRollback {
+					// 回朔用戶錢包金額
+					err = db.Model(user).Update("wallet_amount", user.WalletAmount-int64(amount)).Error
+					if err != nil {
+						fmt.Fprintln(w, "got err but db.Model(user).Update get error: "+err.Error()+", user: "+fmt.Sprintf("%+v", user))
+						return
+					}
+				}
+			}()
 
-			err =db.Model(user).Update("wallet_amount",user.WalletAmount).Error
-			if err !=nil{
-				fmt.Fprintln(w,err)
+			// Kafka 消息傳遞給其他同學的服務
+			b, err := json.Marshal(user)
+			if err != nil {
+				needRollback = true
+				fmt.Fprintln(w, err)
 				return
 			}
-
-      b,err:= json.Marshal(user)
-
-      _,err = kafkaConn.Write(b)
-
-			fmt.Fprintln(w,(name+"的wallet還有"+strconv.Itoa(int(user.WalletAmount))))
-
-			lockVal :=redisClient.Get(name).String()
-			if lockVal=="lock"+"mingyu"{
-				redisClient.Del(name)
+			ctx := context.Background()
+			err = kafkaWriter.WriteMessages(ctx, kafka.Message{Value: b})
+			if err != nil {
+				needRollback = true
+				fmt.Fprintln(w, err)
+				return
 			}
-		}else{
-			fmt.Fprintln(w, "not get lock")
+		} else { // 沒搶到鎖
+			fmt.Fprintln(w, "不好意思你沒搶到鎖")
 			return
 		}
-
+		fmt.Fprintln(w, "成功增減錢")
 	})
 
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
-		// Get Query Val
-		m := r.URL.Query()
-
+		m := r.URL.Query() // ../ping?name=jase&title=student&amount=100&... -> map[name] = []string{"jase"}, map[title] = []string{"stuent"}, map["amount"] = []string{"100"}
 		names := m["name"]
 
-		// if len(names) != 0 {
-		// 	switch names[0] {
-		// 	case "學長":
-		// 		fmt.Fprintf(w, "Hello , 學長")
-		// 		break
-		// 	case "學姊":
-		// 		fmt.Fprintf(w, "Hello , 學姊")
-		// 		break
-		// 	default:
-		// 		fmt.Fprintf(w, "我好帥")
-		// 	}
-		// 	// return
-		// }
-
-		user := &Users{}
-		user.Name = names[0]
-		err := db.Where("name = ?", user.Name).First(&user).Error
-
-		if err != nil {
-			// user.ID = cnt
-			err = db.Create(user).Error
-			if err != nil {
-				fmt.Fprintln(w, "add user NG")
-
-			} else {
-				fmt.Fprintln(w, "add user OK")
-				// cnt++
+		if len(names) != 0 {
+			fmt.Fprintf(w, "Hello "+names[0]) // names := []string{"a", "b", "c"}, names[0] = "a", names[1] = "b" ...
+			switch names[0] {
+			case "天麒教授":
+				fmt.Fprintln(w, "教授您好")
+			default:
+				fmt.Fprintln(w, "Hi")
 			}
 
-		} else {
-			fmt.Fprintln(w, "the same user is exixt in DB")
+			var user = &User{}
+			user.Name = names[0]
+			err := db.Where("name = ?", user.Name).First(&user).Error
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					err = db.Create(user).Error
+					if err != nil {
+						fmt.Fprintln(w, err)
+						return
+					}
+				} else {
+					fmt.Fprintln(w, err)
+					return
+				}
+			} else {
+				fmt.Fprintln(w, "您已註冊過了")
+			}
 		}
-		// fmt.Println(err)
-
-		fmt.Print("Hello")
-		fmt.Fprintf(w, "Hello World")
-
+		fmt.Fprintln(w, "Hello World")
 	})
 
-	fmt.Println("Server Start ... ")
-	// log.Fatal(http.ListenAndServe(":8080", nil))
+	fmt.Println("server start...")
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func initDB() (*gorm.DB, error) {
-	addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8&parseTime=True", UserName, Password, Addr, Port, Database)
-	db, err := gorm.Open(mysql.Open(addr), &gorm.Config{})
-	if err != nil {
-		return nil, err
+func consumerCashTopic(db *gorm.DB) {
+	topic := "nim7i0vg-cash"
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:  []string{"dory-01.srvs.cloudkafka.com:9094", "dory-02.srvs.cloudkafka.com:9094", "dory-03.srvs.cloudkafka.com:9094"},
+		Topic:    topic,
+		MaxWait:  500 * time.Millisecond,
+		MinBytes: 1,
+		MaxBytes: 100,
+	})
+	ctx := context.Background()
+	for {
+		msg, err := reader.ReadMessage(ctx)
+		if err != nil {
+			fmt.Printf("reader.ReadMessage() get err : %v", err)
+			continue
+		}
+		b := msg.Value
+		fmt.Println(string(b))
+		var user = &User{}
+		err = json.Unmarshal(b, user)
+		if err != nil {
+			fmt.Printf("consumerCashTopic get err : %v", err)
+			continue
+		}
+		if user.Name == "" {
+			continue
+		}
+		user.ID = 0
+		// 檢查用戶是否存在，如果不存在就創建
+		var myUser = &User{
+			Name:         user.Name,
+			WalletAmount: user.WalletAmount,
+		}
+		err = db.Where("name = ?", user.Name).FirstOrCreate(myUser).Error
+		if err != nil {
+			fmt.Printf("FirstOrCreate get err: %v", err)
+			continue
+		}
+		if myUser.WalletAmount != user.WalletAmount {
+			// 更新用戶錢包金額
+			err = db.Model(&User{}).Update("wallet_amount", user.WalletAmount).Where("name = ?", user.Name).Error
+			if err != nil {
+				fmt.Println("db.Model(user).Update get error: " + err.Error() + ", user: " + fmt.Sprintf("%+v", user))
+				continue
+			}
+		}
 	}
-	return db, nil
+}
+
+func initKafka() *kafka.Writer {
+	topic := "nim7i0vg-cash"
+	return kafka.NewWriter(kafka.WriterConfig{
+		Brokers: []string{"dory-01.srvs.cloudkafka.com:9094", "dory-02.srvs.cloudkafka.com:9094", "dory-03.srvs.cloudkafka.com:9094"},
+		Topic:   topic,
+	})
 }
 
 func initRedis() (*redis.Client, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     "redis-15690.c257.us-east-1-3.ec2.cloud.redislabs.com:15690",
-		Password: "T0PCm03FfnkVLSOIzCsDqwgCYHbq52Dk", // no password set
-		DB:       0,                                  // use default DB
+		Password: "T0PCm03FfnkVLSOIzCsDqwgCYHbq52Dk",
+		DB:       0, // use default DB
 	})
-	pong, err := client.Ping().Result()
+	_, err := client.Ping().Result()
 	if err != nil {
 		return nil, err
 	}
-	log.Print(pong)
 	return client, nil
 }
 
-
-func initKafka() (*kafka.Conn ,error){
-	topic := "nim7i0vg-cash"
-	partition := 0
-
-	conn, err := kafka.DialLeader(context.Background(), "tcp", "dory-01.srvs.cloudkafka.com:9094,dory-02.srvs.cloudkafka.com:9094,dory-03.srvs.cloudkafka.com:9094", topic, partition)
-	return conn, err
-}
-
-func consumerCashTopic(conn *kafka.Conn,db *gorm.DB){
-  batch := conn.ReadBatch(10e3, 1e6)
-  b:= make([]byte,10e3)
-  for{
-    _,err := batch.Read(b)
-    if err != nil{
-      break
-    }
-
-    fmt.Println(string((b)))
-    var user  = &Users{}
-    err = json.Unmarshal(b, user)
-    if err != nil{
-      fmt.Printf("consumerCashTopic get err : %v",err)
-      continue
-    }
-
-    if user.Name == ""{
-      continue
-    }
-
-    user.ID = 0
-
-    var myUser = &Users{
-      Name:user.Name,
-      WalletAmount:user.WalletAmount,
-    }
-
-    err = db.Where("name = ?", user.Name).FirstOrCreate(myUser).Error
-
-    if myUser.WalletAmount != user.WalletAmount {
-      err = db.Model(&Users{}).Update("wallet_amount", user.WalletAmount).Where("name = ?", user.Name).Error
-    }
-    
-  }
+func initDB() (*gorm.DB, error) {
+	var dsn = "vsgzsg4ieoutdysr:zxh5755xi5804kfr@tcp(nnsgluut5mye50or.cbetxkdyhwsb.us-east-1.rds.amazonaws.com:3306)/rz4cip81n7mk2fdk?charset=utf8mb4&parseTime=True&loc=Local"
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
 }
