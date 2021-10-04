@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+  kafka "github.com/segmentio/kafka-go"
 	"github.com/go-redis/redis"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+  "encoding/json"
+  "context"
 )
 
 const (
@@ -38,6 +41,8 @@ func main() {
 		// log.Fatal("$PORT must be set")
 		port = "8080"
 	}
+
+  kafkaConn,err := initKafka() 
 
 	db, err := initDB()
 	if err != nil {
@@ -93,6 +98,11 @@ func main() {
 				fmt.Fprintln(w,err)
 				return
 			}
+
+      b,err:= json.Marshal(user)
+
+      _,err = kafkaConn.Write(b)
+
 			fmt.Fprintln(w,(name+"的wallet還有"+strconv.Itoa(int(user.WalletAmount))))
 
 			lockVal :=redisClient.Get(name).String()
@@ -177,4 +187,13 @@ func initRedis() (*redis.Client, error) {
 	}
 	log.Print(pong)
 	return client, nil
+}
+
+
+func initKafka() (*kafka.Conn ,error){
+	topic := "nim7i0vg-cash"
+	partition := 0
+
+	conn, err := kafka.DialLeader(context.Background(), "tcp", "dory-01.srvs.cloudkafka.com:9094,dory-02.srvs.cloudkafka.com:9094,dory-03.srvs.cloudkafka.com:9094", topic, partition)
+	return conn, err
 }
